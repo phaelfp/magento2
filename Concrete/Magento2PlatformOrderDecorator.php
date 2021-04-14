@@ -13,18 +13,25 @@ use Magento\Sales\Model\Order\Payment\Transaction\Repository as TransactionRepos
 use Magento\Sales\Model\Order\Payment\Repository as PaymentRepository;
 use Mundipagg\Core\Kernel\Abstractions\AbstractModuleCoreSetup as MPSetup;
 use Mundipagg\Core\Kernel\Abstractions\AbstractPlatformOrderDecorator;
+use Mundipagg\Core\Kernel\Aggregates\Charge;
 use Mundipagg\Core\Kernel\Interfaces\PlatformInvoiceInterface;
+use Mundipagg\Core\Kernel\Interfaces\PlatformOrderInterface;
 use Mundipagg\Core\Kernel\Services\MoneyService;
+use Mundipagg\Core\Kernel\Services\OrderService;
 use Mundipagg\Core\Kernel\ValueObjects\Id\CustomerId;
 use Mundipagg\Core\Kernel\ValueObjects\Id\OrderId;
 use Mundipagg\Core\Kernel\ValueObjects\OrderState;
 use Mundipagg\Core\Kernel\ValueObjects\OrderStatus;
+use Mundipagg\Core\Kernel\ValueObjects\PaymentMethod;
 use Mundipagg\Core\Payment\Aggregates\Address;
 use Mundipagg\Core\Payment\Aggregates\Customer;
 use Mundipagg\Core\Payment\Aggregates\Item;
 use Mundipagg\Core\Payment\Aggregates\Payments\AbstractCreditCardPayment;
 use Mundipagg\Core\Payment\Aggregates\Payments\AbstractPayment;
 use Mundipagg\Core\Payment\Aggregates\Payments\BoletoPayment;
+use Mundipagg\Core\Payment\Aggregates\Payments\NewDebitCardPayment;
+use Mundipagg\Core\Payment\Aggregates\Payments\NewVoucherPayment;
+use Mundipagg\Core\Payment\Aggregates\Payments\PixPayment;
 use Mundipagg\Core\Payment\Aggregates\Shipping;
 use Mundipagg\Core\Payment\Factories\PaymentFactory;
 use Mundipagg\Core\Payment\Repositories\CustomerRepository as CoreCustomerRepository;
@@ -32,6 +39,10 @@ use Mundipagg\Core\Payment\Repositories\SavedCardRepository;
 use Mundipagg\Core\Payment\ValueObjects\CustomerPhones;
 use Mundipagg\Core\Payment\ValueObjects\CustomerType;
 use Mundipagg\Core\Payment\ValueObjects\Phone;
+use Mundipagg\Core\Recurrence\Aggregates\Plan;
+use Mundipagg\Core\Recurrence\Services\RecurrenceService;
+use MundiPagg\MundiPagg\Helper\BuildChargeAddtionalInformationHelper;
+use MundiPagg\MundiPagg\Helper\RecurrenceProductHelper;
 use MundiPagg\MundiPagg\Gateway\Transaction\Base\Config\Config;
 use MundiPagg\MundiPagg\Model\Cards;
 use MundiPagg\MundiPagg\Model\CardsRepository;
@@ -39,6 +50,9 @@ use Mundipagg\Core\Kernel\Services\LocalizationService;
 use Mundipagg\Core\Kernel\Services\LogService;
 use Magento\Sales\Model\Order\Email\Sender\OrderCommentSender;
 use Magento\Sales\Model\ResourceModel\Order\Status\Collection;
+use Mundipagg\Core\Kernel\Aggregates\Transaction;
+use Mundipagg\Core\Kernel\ValueObjects\TransactionType;
+use Magento\Quote\Model\Quote;
 
 class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
 {
@@ -52,12 +66,18 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
     private $quote;
     private $i18n;
 
+    /**
+     * @var OrderService
+     */
+    private $orderService;
+
     public function __construct()
     {
         $this->i18n = new LocalizationService();
         $objectManager = ObjectManager::getInstance();
 
         $this->orderFactory = $objectManager->get('Magento\Sales\Model\Order');
+        $this->orderService = new OrderService();
         parent::__construct();
     }
 
@@ -119,22 +139,31 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
      */
     public function sendEmail($message)
     {
-        $objectManager = ObjectManager::getInstance();
+        $log = new LogService('Order', true);
+        $log->info("Try send e-mail: {$message}");
 
-        $sendConfigGlobalEmail = MPSetup::getModuleConfiguration()->isSendMailEnabled();
+        try {
+            $objectManager = ObjectManager::getInstance();
 
-        if (!$sendConfigGlobalEmail) {
-            return false;
+            $sendConfigGlobalEmail = MPSetup::getModuleConfiguration()->isSendMailEnabled();
+
+            if (!$sendConfigGlobalEmail) {
+                $log->info("The e-mail sending configuration is disabled. E-mail not sent");
+                return false;
+            }
+
+            /* @var OrderCommentSender $orderCommentSender */
+            $orderCommentSender = $objectManager->create(OrderCommentSender::class);
+
+            return $orderCommentSender->send(
+                $this->platformOrder,
+                true,
+                $message
+            );
+        } catch (\Exception $e) {
+            $log->info("Unable to send e-mail");
+            $log->exception($e);
         }
-
-        /* @var OrderCommentSender $orderCommentSender */
-        $orderCommentSender = $objectManager->create(OrderCommentSender::class);
-
-        return $orderCommentSender->send(
-            $this->platformOrder,
-            true,
-            $message
-        );
     }
 
     /**
@@ -173,6 +202,49 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         $this->platformOrder->$historyMethod($message)
             ->setIsCustomerNotified($notifyCustomer)
             ->save();
+    }
+
+    /**
+     * @param string $name
+     * @param string $value
+     * @return void
+     */
+    public function setAdditionalInformation($name, $value)
+    {
+        $this->platformOrder
+            ->getPayment()
+            ->setAdditionalInformation($name, $value)
+            ->save();
+    }
+
+    /**
+     * @param Charge[] $charges
+     * @return array[['key' => value]]
+     */
+    public function extractAdditionalChargeInformation(array $charges)
+    {
+        return BuildChargeAddtionalInformationHelper::build(
+            $this->getPaymentMethodPlatform(),
+            $charges
+        );
+    }
+
+    /**
+     * @param Charge[] $charges
+     */
+    public function addAdditionalInformation(array $charges) {
+        $chargesAddtionalInformation = $this->extractAdditionalChargeInformation(
+            $charges
+        );
+
+        foreach ($chargesAddtionalInformation as $chargesInformation) {
+            foreach ($chargesInformation as $propertyName => $value) {
+                $this->setAdditionalInformation(
+                    $propertyName,
+                    $value
+                );
+            }
+        }
     }
 
     public function setIsCustomerNotified()
@@ -277,6 +349,14 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
     }
 
     /**
+     * @return string
+     */
+    public function getPaymentMethodPlatform()
+    {
+        return $this->getPlatformOrder()->getPayment()->getMethod();
+    }
+
+    /**
      * @return PlatformInvoiceInterface[]
      */
     public function getInvoiceCollection()
@@ -291,17 +371,31 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         return $invoiceCollection;
     }
 
-    /** @return OrderId */
+    /**
+     * @return OrderId|null
+     */
     public function getMundipaggId()
     {
-        $orderId = $this->platformOrder->getPayment()->getLastTransId();
+        $orderId = null;
 
-        if (empty($orderId)) {
-            return null;
+        if ($this->platformOrder->getPayment() != null) {
+            $orderId = $this->platformOrder->getPayment()->getLastTransId();
         }
-        $orderId = substr($orderId, 0 , 19);
 
-        return new OrderId($orderId);
+        if (!empty($orderId)) {
+            $orderId = substr($orderId, 0, 19);
+            return new OrderId($orderId);
+        }
+
+        $orderCore = $this->orderService->getOrderByPlatformId(
+            $this->platformOrder->getIncrementId()
+        );
+
+        if ($orderCore == null) {
+            return $orderId;
+        }
+
+        return $orderCore->getMundipaggId();
     }
 
     public function getHistoryCommentCollection()
@@ -388,13 +482,21 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         return $this->$method($quote);
     }
 
-
+    /**
+     * @param Quote $quote
+     * @return Customer
+     * @throws \Exception
+     */
     private function getRegisteredCustomer($quote)
     {
         $quoteCustomer = $quote->getCustomer();
 
         $addresses = $quoteCustomer->getAddresses();
         $address = end($addresses);
+
+        if (!$address) {
+            $address = $quote->getBillingAddress();
+        }
 
         $customerRepository =
             ObjectManager::getInstance()->get(CustomerRepository::class);
@@ -436,7 +538,7 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         $cleanDocument = preg_replace(
             '/\D/',
             '',
-            $quote->getCustomerTaxvat()
+            $quote->getCustomer()->getTaxVat()
         );
 
         if (empty($cleanDocument)) {
@@ -462,14 +564,18 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         $customer->setAddress($address);
 
         return $customer;
-
     }
 
+    /**
+     * @param Quote $quote
+     * @return Customer
+     * @throws \Exception
+     */
     private function getGuestCustomer($quote)
     {
         $guestAddress = $quote->getBillingAddress();
 
-        $customer = new Customer;
+        $customer = new Customer();
 
         $customer->setName($guestAddress->getName());
         $customer->setEmail($guestAddress->getEmail());
@@ -516,8 +622,6 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
             $price = $quoteItem->getPrice();
             $price = $price > 0 ? $price : "0.01";
 
-            $productType = $quoteItem->getProductType();
-
             if ($price === null) {
                 continue;
             }
@@ -537,8 +641,8 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
                 $moneyService->floatToCents($price)
             );
 
-            if ($quoteItem->getItemId()) {
-                $item->setCode($quoteItem->getItemId());
+            if ($quoteItem->getProductId()) {
+                $item->setCode($quoteItem->getProductId());
             }
 
             $item->setQuantity($quoteItem->getQty());
@@ -546,9 +650,52 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
                 $quoteItem->getName() . ' : ' .
                 $quoteItem->getDescription()
             );
+
+            $item->setName($quoteItem->getName());
+
+            $helper = new RecurrenceProductHelper();
+            $selectedRepetition = $helper->getSelectedRepetition($quoteItem);
+            $item->setSelectedOption($selectedRepetition);
+
+            $this->setRecurrenceInfo($item, $quoteItem);
+
             $items[] = $item;
         }
         return $items;
+    }
+
+    public function setRecurrenceInfo($item, $quoteItem)
+    {
+        $recurrenceService = $this->getRecurrenceService();
+        $productId = $quoteItem->getProduct()->getId();
+
+        $coreProduct =
+            $recurrenceService->getRecurrenceProductByProductId(
+                $productId
+            );
+
+        if (!$coreProduct) {
+            return null;
+        }
+
+        $type = $coreProduct->getRecurrenceType();
+
+        if ($type == Plan::RECURRENCE_TYPE) {
+            $item->setMundipaggId($coreProduct->getMundipaggId());
+            $item->setType($type);
+            return $item;
+        }
+
+        if (!empty($item->getSelectedOption())) {
+            $item->setType($type);
+        }
+
+        return $item;
+    }
+
+    public function getRecurrenceService()
+    {
+        return new RecurrenceService();
     }
 
     public function getQuote()
@@ -571,6 +718,7 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
 
         if (empty($payments)) {
             $baseNewPayment = $this->platformOrder->getPayment();
+
             $newPayment = [];
             $newPayment['method'] = $baseNewPayment->getMethod();
             $newPayment['additional_information'] =
@@ -582,7 +730,9 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
 
         foreach ($payments as $payment) {
             $handler = explode('_', $payment['method']);
-            array_walk($handler, function(&$part){$part = ucfirst($part);});
+            array_walk($handler, function (&$part) {
+                $part = ucfirst($part);
+            });
             $handler = 'extractPaymentDataFrom' . implode('', $handler);
             $this->$handler(
                 $payment['additional_information'],
@@ -605,16 +755,66 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         $payment
     )
     {
+        $newPaymentData = $this->extractBasePaymentData(
+            $additionalInformation
+        );
+
+        $creditCardDataIndex = AbstractCreditCardPayment::getBaseCode();
+        if (!isset($paymentData[$creditCardDataIndex])) {
+            $paymentData[$creditCardDataIndex] = [];
+        }
+        $paymentData[$creditCardDataIndex][] = $newPaymentData;
+    }
+
+    private function extractPaymentDataFromMundipaggVoucher
+    (
+        $additionalInformation,
+        &$paymentData,
+        $payment
+    )
+    {
+        $newPaymentData = $this->extractBasePaymentData(
+            $additionalInformation
+        );
+
+        $creditCardDataIndex = NewVoucherPayment::getBaseCode();
+        if (!isset($paymentData[$creditCardDataIndex])) {
+            $paymentData[$creditCardDataIndex] = [];
+        }
+        $paymentData[$creditCardDataIndex][] = $newPaymentData;
+    }
+
+    private function extractPaymentDataFromMundipaggDebit
+    (
+        $additionalInformation,
+        &$paymentData,
+        $payment
+    )
+    {
+        $newPaymentData = $this->extractBasePaymentData(
+            $additionalInformation
+        );
+
+        $creditCardDataIndex = NewDebitCardPayment::getBaseCode();
+        if (!isset($paymentData[$creditCardDataIndex])) {
+            $paymentData[$creditCardDataIndex] = [];
+        }
+        $paymentData[$creditCardDataIndex][] = $newPaymentData;
+    }
+
+    private function extractBasePaymentData($additionalInformation)
+    {
         $moneyService = new MoneyService();
         $identifier = null;
         $customerId = null;
         $brand = null;
+
         try {
             $brand = strtolower($additionalInformation['cc_type']);
-        }
-        catch (\Throwable $e)
-        {
-
+        } catch (\Exception $e) {
+            // do nothing
+        } catch (\Throwable $e) {
+            // do nothing
         }
 
         if (isset($additionalInformation['cc_token_credit_card'])) {
@@ -646,18 +846,25 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
             isset($additionalInformation['cc_savecard']) &&
             $additionalInformation['cc_savecard'] === '1';
 
+        if (isset($additionalInformation['cc_cvv_card']) && !empty($additionalInformation['cc_cvv_card'])) {
+            $newPaymentData->cvvCard = $additionalInformation['cc_cvv_card'];
+        }
+
         $amount = $this->getGrandTotal() - $this->getBaseTaxAmount();
         $amount = number_format($amount, 2, '.', '');
-        $amount = str_replace('.','', $amount);
-        $amount = str_replace(',','', $amount);
+        $amount = str_replace('.', '', $amount);
+        $amount = str_replace(',', '', $amount);
 
         $newPaymentData->amount = $amount;
 
-        $creditCardDataIndex = AbstractCreditCardPayment::getBaseCode();
-        if (!isset($paymentData[$creditCardDataIndex])) {
-            $paymentData[$creditCardDataIndex] = [];
+        if ($additionalInformation['cc_buyer_checkbox']) {
+            $newPaymentData->customer = $this->extractMultibuyerData(
+                'cc',
+                $additionalInformation
+            );
         }
-        $paymentData[$creditCardDataIndex][] = $newPaymentData;
+
+        return $newPaymentData;
     }
 
     private function extractPaymentDataFromMundipaggTwoCreditCard
@@ -672,9 +879,7 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
             $brand = null;
             try {
                 $brand = strtolower($additionalInformation["cc_type_{$index}"]);
-            }
-            catch (\Throwable $e)
-            {
+            } catch (\Throwable $e) {
 
             }
 
@@ -710,8 +915,11 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
                 $index
             );
 
-            $amount = $additionalInformation["cc_{$index}_card_amount"];
-            $newPaymentData->amount = $moneyService->floatToCents($amount);
+            $amount = $moneyService->removeSeparators(
+                $additionalInformation["cc_{$index}_card_amount"]
+            );
+
+            $newPaymentData->amount = $moneyService->floatToCents($amount / 100);
             $newPaymentData->saveOnSuccess =
                 isset($additionalInformation["cc_savecard_{$index}"]) &&
                 $additionalInformation["cc_savecard_{$index}"] === '1';
@@ -728,7 +936,8 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         $prefix,
         $additionalInformation,
         $index = null
-    ) {
+    )
+    {
         $index = $index !== null ? '_' . $index : null;
 
         if (
@@ -748,7 +957,9 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
             "{$prefix}_buyer_street_complement{$index}" => "complement",
             "{$prefix}_buyer_city{$index}" => "city",
             "{$prefix}_buyer_state{$index}" => "state",
-            "{$prefix}_buyer_zipcode{$index}" => "zipCode"
+            "{$prefix}_buyer_zipcode{$index}" => "zipCode",
+            "{$prefix}_buyer_home_phone{$index}" => "homePhone",
+            "{$prefix}_buyer_mobile_phone{$index}" => "mobilePhone"
         ];
 
         $multibuyer = new \stdClass();
@@ -767,14 +978,6 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
             $multibuyer->$attribute = $value;
         }
 
-        /** @todo @fixme since the frontend form doesn't have the phone input yet,
-         *        we are getting it from the order customer itself.
-         */
-        $orderCustomer = $this->getCustomer();
-        $homePhone = $orderCustomer->getPhones()->getHome();
-        $multibuyer->homePhone = $homePhone->getFullNumber();
-        $multibuyer->mobilePhone = $homePhone->getFullNumber();
-
         return $multibuyer;
     }
 
@@ -790,9 +993,7 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         $brand = null;
         try {
             $brand = strtolower($additionalInformation['cc_type']);
-        }
-        catch (\Throwable $e)
-        {
+        } catch (\Throwable $e) {
 
         }
 
@@ -827,8 +1028,12 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
             isset($additionalInformation["cc_savecard"]) &&
             $additionalInformation["cc_savecard"] === '1';
 
-        $amount = $additionalInformation["cc_cc_amount"];
-        $newPaymentData->amount = $moneyService->floatToCents($amount);
+        $amount = str_replace(
+            ['.', ','],
+            "",
+            $additionalInformation["cc_cc_amount"]
+        );
+        $newPaymentData->amount = $moneyService->floatToCents($amount / 100);
 
         $creditCardDataIndex = AbstractCreditCardPayment::getBaseCode();
         if (!isset($paymentData[$creditCardDataIndex])) {
@@ -845,8 +1050,15 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         //boleto
 
         $newPaymentData = new \stdClass();
+
+        $amount = str_replace(
+            ['.', ','],
+            "",
+            $additionalInformation["cc_billet_amount"]
+        );
+
         $newPaymentData->amount =
-            $moneyService->floatToCents($additionalInformation["cc_billet_amount"]);
+            $moneyService->floatToCents($amount / 100);
 
         $boletoDataIndex = BoletoPayment::getBaseCode();
         if (!isset($paymentData[$boletoDataIndex])) {
@@ -876,7 +1088,41 @@ class Magento2PlatformOrderDecorator extends AbstractPlatformOrderDecorator
         if (!isset($paymentData[$boletoDataIndex])) {
             $paymentData[$boletoDataIndex] = [];
         }
+
+        if ($additionalInformation['billet_buyer_checkbox']) {
+            $newPaymentData->customer = $this->extractMultibuyerData(
+                'billet',
+                $additionalInformation
+            );
+        }
+
         $paymentData[$boletoDataIndex][] = $newPaymentData;
+    }
+
+    private function extractPaymentDataFromMundipaggPix(
+        $additionalInformation,
+        &$paymentData,
+        $payment
+    )
+    {
+        $moneyService = new MoneyService();
+        $newPaymentData = new \stdClass();
+        $newPaymentData->amount =
+            $moneyService->floatToCents($this->platformOrder->getGrandTotal());
+
+        $pixDataIndex = PixPayment::getBaseCode();
+        if (!isset($paymentData[$pixDataIndex])) {
+            $paymentData[$pixDataIndex] = [];
+        }
+
+        if (!empty($additionalInformation['pix_buyer_checkbox'])) {
+            $newPaymentData->customer = $this->extractMultibuyerData(
+                'pix',
+                $additionalInformation
+            );
+        }
+
+        $paymentData[$pixDataIndex][] = $newPaymentData;
     }
 
     public function getShipping()

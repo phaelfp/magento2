@@ -2,11 +2,9 @@
 
 namespace MundiPagg\MundiPagg\Concrete;
 
-
 use Magento\Framework\App\ObjectManager;
 use Mundipagg\Core\Kernel\Abstractions\AbstractCreditmemoDecorator;
 use Mundipagg\Core\Kernel\Interfaces\PlatformOrderInterface;
-
 
 class Magento2PlatformCreditmemoDecorator extends AbstractCreditmemoDecorator
 {
@@ -46,7 +44,7 @@ class Magento2PlatformCreditmemoDecorator extends AbstractCreditmemoDecorator
         $creditMemo = $creditmemoFactory->createByOrder($platformOrder);
 
         if ($creditMemo) {
-            $platformOrder->setShouldClosePArentTransaction(true);
+            $platformOrder->setShouldCloseParentTransaction(true);
         }
 
         $this->platformCreditmemo = $creditMemo;

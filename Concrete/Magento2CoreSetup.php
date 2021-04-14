@@ -4,6 +4,7 @@ namespace MundiPagg\MundiPagg\Concrete;
 
 use Magento\Framework\App\Config as Magento2StoreConfig;
 use Magento\Config\Model\Config as Magento2ModelConfig;
+use Magento\Framework\App\Config\ScopeConfigInterface;
 use Magento\Framework\Stdlib\DateTime\TimezoneInterface;
 use Magento\Store\Model\ScopeInterface as ScopeInterface;
 use Magento\Framework\App\ObjectManager;
@@ -21,6 +22,9 @@ use MundiPagg\MundiPagg\Gateway\Transaction\CreditCard\Config\ConfigInterface;
 use MundiPagg\MundiPagg\Model\Installments\Config\ConfigInterface as InstallmentConfigInterface;
 use MundiPagg\MundiPagg\Helper\ModuleHelper;
 use MundiPagg\MundiPagg\Model\Enum\CreditCardBrandEnum;
+use Magento\Store\Model\StoreManagerInterface;
+use Magento\Store\Model\Website\Interceptor;
+use stdClass;
 
 final class Magento2CoreSetup extends AbstractModuleCoreSetup
 {
@@ -70,7 +74,11 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
             AbstractModuleCoreSetup::CONCRETE_PLATFORM_CREDITMEMO_DECORATOR_CLASS =>
                 Magento2PlatformCreditmemoDecorator::class,
             AbstractModuleCoreSetup::CONCRETE_DATA_SERVICE =>
-                Magento2DataService::class
+                Magento2DataService::class,
+            AbstractModuleCoreSetup::CONCRETE_PLATFORM_PAYMENT_METHOD_DECORATOR_CLASS =>
+                Magento2PlatformPaymentMethodDecorator::class,
+            AbstractModuleCoreSetup::CONCRETE_PRODUCT_DECORATOR_CLASS =>
+                Magento2PlatformProductDecorator::class
         ];
     }
 
@@ -107,20 +115,38 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
         return $store->getLocaleCode();
     }
 
-    public function loadModuleConfigurationFromPlatform()
+    /**
+     * @param ScopeConfigInterface|null $storeConfig
+     */
+    public function loadModuleConfigurationFromPlatform($storeConfig = null)
     {
         $objectManager = ObjectManager::getInstance();
-        $storeConfig = $objectManager->get(Magento2StoreConfig::class);
-        $configData = new \stdClass;
+
+        if ($storeConfig == null) {
+            $storeConfig = $objectManager->get(Magento2StoreConfig::class);
+        }
+
+        $configData = new \stdClass();
+
+        $storeId = self::getCurrentStoreId();
+
+        if (!self::checkWebSiteExists($storeId)) {
+            self::$moduleConfig = new Configuration();
+            return;
+        }
 
         self::fillWithGeneralConfig($configData, $storeConfig);
         self::fillWithMundipaggKeys($configData, $storeConfig);
         self::fillWithCardConfig($configData, $storeConfig);
         self::fillWithBoletoConfig($configData, $storeConfig);
+        self::fillWithPixConfig($configData, $storeConfig);
         self::fillWithBoletoCreditCardConfig($configData, $storeConfig);
         self::fillWithTwoCreditCardsConfig($configData, $storeConfig);
+        self::fillWithVoucherConfig($configData, $storeConfig);
+        self::fillWithDebitConfig($configData, $storeConfig);
         self::fillWithAddressConfig($configData, $storeConfig);
         self::fillWithMultiBuyerConfig($configData, $storeConfig);
+        self::fillWithRecurrenceConfig($configData, $storeConfig);
         $configData->hubInstallId = null;
 
         $configurationFactory = new ConfigurationFactory();
@@ -129,6 +155,77 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
         );
 
         self::$moduleConfig = $config;
+    }
+
+    /**
+     * @param int $webSiteId
+     * @return bool
+     */
+    private static function checkWebSiteExists($webSiteId)
+    {
+        $objectManager = ObjectManager::getInstance();
+
+        /**
+         * @var StoreManagerInterface $storeManager
+         */
+        $storeManager = $objectManager->get(StoreManagerInterface::class);
+
+        /**
+         * @var Interceptor[] $webSitesList
+         */
+        $webSitesList = $storeManager->getWebsites(true);
+
+        foreach ($webSitesList as $website) {
+            if ($website->getId() == $webSiteId) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    static private function fillWithVoucherConfig(&$dataObj, $storeConfig)
+    {
+        $options = [
+            'enabled' => 'active',
+            'title' => 'title',
+            'cardOperation' => 'payment_action',
+            'cardStatementDescriptor' => 'soft_description',
+            'saveCards' => 'enabled_saved_cards'
+        ];
+
+        $section = 'payment/mundipagg_voucher/';
+
+        $voucherObject = new \stdClass();
+
+        $dataObj->voucherConfig = self::fillDataObj($storeConfig, $options, $voucherObject, $section);
+
+        $operation = Configuration::CARD_OPERATION_AUTH_ONLY;
+        if ($dataObj->voucherConfig->cardOperation === 'authorize_capture') {
+            $operation  = Configuration::CARD_OPERATION_AUTH_AND_CAPTURE;
+        }
+
+        $dataObj->voucherConfig->cardOperation = $operation;
+        $dataObj->voucherConfig->cardConfigs = self::getBrandConfig($storeConfig, $section);
+    }
+
+    static private function fillWithDebitConfig(&$dataObj, $storeConfig)
+    {
+        $options = [
+            'enabled' => 'active',
+            'title' => 'title',
+            'cardOperation' => 'payment_action',
+            'cardStatementDescriptor' => 'soft_description',
+            'saveCards' => 'enabled_saved_cards'
+        ];
+
+        $section = 'payment/mundipagg_debit/';
+
+        $debitObject = new \stdClass();
+
+        $dataObj->debitConfig = self::fillDataObj($storeConfig, $options, $debitObject, $section);
+        $dataObj->debitConfig->cardOperation = Configuration::CARD_OPERATION_AUTH_AND_CAPTURE;
+        $dataObj->debitConfig->cardConfigs = self::getBrandConfig($storeConfig, $section);
     }
 
     static private function fillWithCardConfig(&$dataObj, $storeConfig)
@@ -160,16 +257,37 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
                 $dataObj->antifraudMinAmount * 1
             );
 
-        $dataObj->cardConfigs = self::getBrandConfig($storeConfig);
+        $dataObj->cardConfigs = self::getBrandConfig($storeConfig, $section);
 
         return $dataObj;
     }
+
+    private static function fillWithPixConfig(
+        stdClass $configData,
+        ScopeConfigInterface $storeConfig
+    ) {
+        $options = [
+            'enabled' => 'active',
+            'expirationQrCode' => 'expiration_qrcode',
+            'bankType' => 'types',
+            'title' => 'title'
+        ];
+
+        $section = 'payment/mundipagg_pix/';
+
+        $pixObject = new \stdClass();
+
+        $configData->pixConfig = self::fillDataObj($storeConfig, $options, $pixObject, $section);
+    }
+
 
     static private function fillWithBoletoConfig(&$dataObj, $storeConfig)
     {
         $options = [
             'boletoEnabled' => 'active',
-            'boletoInstructions' => 'instructions'
+            'boletoInstructions' => 'instructions',
+            'boletoDueDays' => 'expiration_days',
+            'boletoBankCode' => 'types'
         ];
         $section = 'payment/mundipagg_billet/';
         $dataObj = self::fillDataObj($storeConfig, $options, $dataObj, $section);
@@ -226,7 +344,8 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
         $options = [
             'enabled' => 'active',
             'testMode' => 'test_mode',
-            'sendMail' => 'sendmail'
+            'sendMail' => 'sendmail',
+            'createOrder' => 'create_order'
         ];
 
         $section = 'mundipagg_mundipagg/global/';
@@ -256,14 +375,9 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
 
     static private function fillDataObj($storeConfig, $options, $dataObj, $section)
     {
-        $objectManager = ObjectManager::getInstance();
-        $config = $objectManager->get(Magento2ModelConfig::class);
+        $scope = ScopeInterface::SCOPE_WEBSITES;
 
-        $scope = ScopeInterface::SCOPE_STORE;
-        $storeId = $config->getStore();
-        if (!$config->getStore()) {
-            $storeId = 1;
-        }
+        $storeId = self::getCurrentStoreId();
 
         foreach ($options as $key => $option) {
             $value = $storeConfig->getValue($section . $option, $scope, $storeId);
@@ -282,20 +396,17 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
         return $dataObj;
     }
 
-    static private function getBrandConfig($storeConfig)
+    static private function getBrandConfig($storeConfig, $section)
     {
         $objectManager = ObjectManager::getInstance();
         $config = $objectManager->get(Magento2ModelConfig::class);
 
-        $storeId = $config->getStore();
-        if (!$config->getStore()) {
-            $storeId = 1;
-        }
-        $scope = ScopeInterface::SCOPE_STORE;
+        $scope = ScopeInterface::SCOPE_WEBSITES;
+        $storeId = self::getCurrentStoreId();
 
         $brands = array_merge([''],explode(
             ',',
-            $storeConfig->getValue('payment/mundipagg_creditcard/cctypes', $scope, $storeId)
+            $storeConfig->getValue($section .  'cctypes', $scope, $storeId)
         ));
 
         $cardConfigs = [];
@@ -315,18 +426,18 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
                 $brandMethod = 'nobrand';
             }
 
-            $max = $storeConfig->getValue('payment/mundipagg_creditcard/installments_number' . $brand, $scope, $storeId);
+            $max = $storeConfig->getValue($section . 'installments_number' . $brand, $scope, $storeId);
             if (empty($max)) {
                 $brand = '';
-                $max = $storeConfig->getValue('payment/mundipagg_creditcard/installments_number' . $brand, $scope, $storeId);
+                $max = $storeConfig->getValue($section . 'installments_number' . $brand, $scope, $storeId);
             }
 
-            $minValue =  $storeConfig->getValue('payment/mundipagg_creditcard/installment_min_amount' . $brand, $scope, $storeId);
-            $initial =  $storeConfig->getValue('payment/mundipagg_creditcard/installments_interest_rate_initial' . $brand, $scope, $storeId);
-            $incremental =  $storeConfig->getValue('payment/mundipagg_creditcard/installments_interest_rate_incremental'. $brand, $scope, $storeId);
-            $maxWithout =  $storeConfig->getValue('payment/mundipagg_creditcard/installments_max_without_interest' . $brand, $scope, $storeId);
+            $minValue =  $storeConfig->getValue($section . 'installment_min_amount' . $brand, $scope, $storeId);
+            $initial =  $storeConfig->getValue($section . 'installments_interest_rate_initial' . $brand, $scope, $storeId);
+            $incremental =  $storeConfig->getValue($section . 'installments_interest_rate_incremental'. $brand, $scope, $storeId);
+            $maxWithout =  $storeConfig->getValue($section . 'installments_max_without_interest' . $brand, $scope, $storeId);
 
-            $interestByBrand =  $storeConfig->getValue('payment/mundipagg_creditcard/installments_interest_by_issuer' . $brand, $scope, $storeId);
+            $interestByBrand =  $storeConfig->getValue($section . 'installments_interest_by_issuer' . $brand, $scope, $storeId);
             if (empty($interestByBrand)) {
                 $initial = 0;
                 $incremental = 0;
@@ -336,8 +447,8 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
             $cardConfigs[] = new CardConfig(
                 true,
                 CardBrand::$brandMethod(),
-                $max,
-                $maxWithout,
+                ($max !== null ? $max : 1),
+                ($maxWithout !== null ? $maxWithout : 1),
                 $initial,
                 $incremental,
                 ($minValue !== null ? $minValue : 0) * 100
@@ -425,5 +536,39 @@ final class Magento2CoreSetup extends AbstractModuleCoreSetup
         $dateTimeZone = new \DateTimeZone($timezoneString);
 
         return $dateTimeZone;
+    }
+
+    static private function fillWithRecurrenceConfig(&$dataObj, $storeConfig)
+    {
+        $options = [
+            'enabled' => 'active',
+
+            'showRecurrenceCurrencyWidget' => 'show_recurrence_currency_widget',
+
+            'purchaseRecurrenceProductWithNormalProduct'
+            => 'purchase_recurrence_product_with_normal_product',
+
+            'conflictMessageRecurrenceProductWithNormalProduct'
+            => 'conflict_recurrence_product_with_normal_product',
+
+            'purchaseRecurrenceProductWithRecurrenceProduct'
+            => 'purchase_recurrence_product_with_recurrence_product',
+
+            'conflictMessageRecurrenceProductWithRecurrenceProduct'
+            => 'conflict_recurrence_product_with_recurrence_product',
+
+            'decreaseStock'
+            => 'decrease_stock',
+        ];
+
+        $section = 'mundipagg_mundipagg/recurrence/';
+
+        $recurrenceConfig = new \stdClass();
+        $dataObj->recurrenceConfig = self::fillDataObj(
+            $storeConfig,
+            $options,
+            $recurrenceConfig,
+            $section
+        );
     }
 }
